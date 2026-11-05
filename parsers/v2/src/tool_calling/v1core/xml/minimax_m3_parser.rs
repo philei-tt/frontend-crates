@@ -66,6 +66,74 @@ pub(crate) fn parse_minimax_m3_invoke(
     Ok(Some((name, arguments)))
 }
 
+/// MiniMax-M3.1 often writes one newline just inside a string parameter's tags
+/// (`<text>café\n</text>`) that the intended value does not contain; MiniMax's own
+/// endpoint and schema-exact clients expect it gone. Drop exactly one `\n` (or
+/// `\r\n`) directly after the open tag and directly before the close tag. Any other
+/// whitespace, and every inner newline, is the model's text and stays.
+pub(crate) fn trim_tag_newlines(raw: &str) -> &str {
+    let raw = raw
+        .strip_prefix("\r\n")
+        .or_else(|| raw.strip_prefix('\n'))
+        .unwrap_or(raw);
+    raw.strip_suffix("\r\n")
+        .or_else(|| raw.strip_suffix('\n'))
+        .unwrap_or(raw)
+}
+
+/// MiniMax's chat template renders `None` arguments by omitting the field, so the
+/// model omits a key it means as null. When the tool declares that key `required`
+/// and its schema provably admits `null`, the only schema-valid reading of the
+/// omission is `null`: append it. A key whose schema does not admit null, or whose
+/// nullability cannot be proven, is left missing rather than invented.
+pub(crate) fn append_required_nulls(
+    name: &str,
+    arguments: String,
+    tools: &[ToolDefinition],
+) -> anyhow::Result<String> {
+    let Some(root) = get_arguments_config(name, Some(tools)) else {
+        return Ok(arguments);
+    };
+    let Some(required) = root.get("required").and_then(Value::as_array) else {
+        return Ok(arguments);
+    };
+    let present: Value = serde_json::from_str(&arguments)?;
+    let Some(present) = present.as_object() else {
+        return Ok(arguments);
+    };
+    let mut missing = Vec::new();
+    for key in required.iter().filter_map(Value::as_str) {
+        if present.contains_key(key) || missing.contains(&key) {
+            continue;
+        }
+        let Some(schema) = parameter_schema(root, key) else {
+            continue;
+        };
+        let schema: &Value = &schema;
+        let mut walker = SchemaFacts::new(root);
+        if walker.permits_null(schema) == Some(true) && !walker.exhausted {
+            missing.push(key);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(arguments);
+    }
+    let mut arguments = arguments;
+    let close = arguments
+        .pop()
+        .filter(|close| *close == '}')
+        .ok_or_else(|| anyhow::anyhow!("arguments are not a JSON object"))?;
+    for key in missing {
+        if arguments.len() > 1 {
+            arguments.push(',');
+        }
+        arguments.push_str(&serde_json::to_string(key)?);
+        arguments.push_str(":null");
+    }
+    arguments.push(close);
+    Ok(arguments)
+}
+
 // Reads the `name` attribute from `<invoke ...>` using vLLM-compatible quoting variants.
 pub(crate) fn parse_invoke_name(tag_attrs: &str) -> Option<String> {
     let attrs = tag_attrs.trim_start();
@@ -140,6 +208,11 @@ fn parse_parameters(
 
     for (parameter_name, raw_value) in parameter_values(body, config, root_schema) {
         let schema = parameter_schema(root_schema, parameter_name);
+        let raw_value = if is_literal_string(schema.as_deref(), root_schema) {
+            trim_tag_newlines(raw_value)
+        } else {
+            raw_value
+        };
         let value = parse_parameter_value(raw_value, schema.as_deref(), root_schema, config);
         insert_parameter(&mut parameters, parameter_name.to_string(), value);
     }
