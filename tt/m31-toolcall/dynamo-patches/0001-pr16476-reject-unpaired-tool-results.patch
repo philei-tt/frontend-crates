@@ -1,0 +1,416 @@
+diff --git a/lib/llm/src/protocols/anthropic/types.rs b/lib/llm/src/protocols/anthropic/types.rs
+index 5ac3d75b66a3..0b1fb26ebac5 100644
+--- a/lib/llm/src/protocols/anthropic/types.rs
++++ b/lib/llm/src/protocols/anthropic/types.rs
+@@ -222,7 +222,11 @@ impl TryFrom<AnthropicCreateMessageRequest> for NvCreateChatCompletionRequest {
+ }
+ 
+ /// Convert user-role content blocks into chat completion messages.
+-/// Tool results become separate Tool messages; text/image blocks become user messages.
++///
++/// Each tool_result becomes a Tool message, emitted in block order. All text and
++/// image blocks are merged into one user message placed after them, so the tool
++/// results stay adjacent to the assistant tool_calls they answer even when a
++/// client puts text before a tool_result.
+ fn convert_user_blocks(
+     blocks: &[AnthropicContentBlock],
+     messages: &mut Vec<ChatCompletionRequestMessage>,
+@@ -254,10 +258,6 @@ fn convert_user_blocks(
+                 content,
+                 ..
+             } => {
+-                // Flush any accumulated content parts before the tool result message.
+-                flush_user_content_parts(&mut content_parts, has_image, messages);
+-                has_image = false;
+-
+                 let content = content
+                     .as_ref()
+                     .map(convert_tool_result_content)
+@@ -281,7 +281,6 @@ fn convert_user_blocks(
+         }
+     }
+ 
+-    // Flush remaining content parts.
+     flush_user_content_parts(&mut content_parts, has_image, messages);
+ 
+     Ok(())
+@@ -2672,8 +2671,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn test_image_with_tool_result_flush() {
+-        // Image + text should flush as Array before tool_result becomes a Tool message.
++    fn test_content_before_tool_result_follows_tool_message() {
+         let req = AnthropicCreateMessageRequest {
+             model: "test-model".into(),
+             max_tokens: 100,
+@@ -2699,6 +2697,11 @@ mod tests {
+                     role: AnthropicRole::User,
+                     content: AnthropicMessageContent::Blocks {
+                         content: vec![
++                            AnthropicContentBlock::Text {
++                                text: "Here it is.".into(),
++                                citations: None,
++                                cache_control: None,
++                            },
+                             AnthropicContentBlock::Image {
+                                 source: AnthropicImageSource {
+                                     source_type: "base64".into(),
+@@ -2712,6 +2715,11 @@ mod tests {
+                                 is_error: None,
+                                 cache_control: None,
+                             },
++                            AnthropicContentBlock::Text {
++                                text: " What do you see?".into(),
++                                citations: None,
++                                cache_control: None,
++                            },
+                         ],
+                     },
+                 },
+@@ -2734,29 +2742,39 @@ mod tests {
+         };
+ 
+         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
+-        // user("What's the weather?"), assistant(tool_use), user(image), tool("screenshot taken")
++        // user("What's the weather?"), assistant(tool_use), tool("screenshot taken"),
++        // user(text, image, text)
+         assert_eq!(chat_req.inner.messages.len(), 4);
+ 
+-        // Third message: user with image (Array format, flushed before tool_result)
+         match &chat_req.inner.messages[2] {
++            ChatCompletionRequestMessage::Tool(t) => assert_eq!(t.tool_call_id, "tool_1"),
++            other => panic!("expected tool message, got {other:?}"),
++        }
++
++        match &chat_req.inner.messages[3] {
+             ChatCompletionRequestMessage::User(u) => match &u.content {
+                 ChatCompletionRequestUserMessageContent::Array(parts) => {
+-                    assert_eq!(parts.len(), 1);
++                    assert_eq!(parts.len(), 3);
+                     assert!(matches!(
+                         &parts[0],
++                        ChatCompletionRequestUserMessageContentPart::Text(t) if t.text == "Here it is."
++                    ));
++                    assert!(matches!(
++                        &parts[1],
+                         ChatCompletionRequestUserMessageContentPart::ImageUrl(_)
+                     ));
++                    assert!(matches!(
++                        &parts[2],
++                        ChatCompletionRequestUserMessageContentPart::Text(t) if t.text == " What do you see?"
++                    ));
+                 }
+                 other => panic!("expected Array content for image, got {other:?}"),
+             },
+             other => panic!("expected user message, got {other:?}"),
+         }
+ 
+-        // Fourth message: tool result
+-        assert!(matches!(
+-            &chat_req.inner.messages[3],
+-            ChatCompletionRequestMessage::Tool(_)
+-        ));
++        crate::engines::ValidateRequest::validate(&chat_req)
++            .expect("tool result must pair with the preceding tool_use");
+     }
+ }
+ 
+diff --git a/lib/llm/src/protocols/openai/chat_completions.rs b/lib/llm/src/protocols/openai/chat_completions.rs
+index 85b2cfe144c8..6b0a9b8d76d4 100644
+--- a/lib/llm/src/protocols/openai/chat_completions.rs
++++ b/lib/llm/src/protocols/openai/chat_completions.rs
+@@ -1656,6 +1656,130 @@ mod tests {
+         }
+     }
+ 
++    fn assistant_tool_calls(ids: &[&str]) -> serde_json::Value {
++        let tool_calls: Vec<_> = ids
++            .iter()
++            .map(|id| {
++                json!({
++                    "id": id,
++                    "type": "function",
++                    "function": {"name": "get_weather", "arguments": "{}"}
++                })
++            })
++            .collect();
++        json!({"role": "assistant", "content": null, "tool_calls": tool_calls})
++    }
++
++    fn tool_result(id: &str) -> serde_json::Value {
++        json!({"role": "tool", "tool_call_id": id, "content": "sunny"})
++    }
++
++    fn user(content: &str) -> serde_json::Value {
++        json!({"role": "user", "content": content})
++    }
++
++    fn validate_history(messages: Vec<serde_json::Value>) -> Result<(), anyhow::Error> {
++        ValidateRequest::validate(&chat_request_with(&json!({"messages": messages})))
++    }
++
++    #[test]
++    fn test_validate_messages_accepts_paired_tool_results() {
++        let histories = [
++            vec![
++                user("weather?"),
++                assistant_tool_calls(&["call_1"]),
++                tool_result("call_1"),
++            ],
++            vec![
++                user("weather?"),
++                assistant_tool_calls(&["call_1", "call_2"]),
++                tool_result("call_2"),
++                tool_result("call_1"),
++                user("and tomorrow?"),
++                assistant_tool_calls(&["call_1"]),
++                tool_result("call_1"),
++            ],
++            vec![
++                user("weather?"),
++                assistant_tool_calls(&["call_1", "call_2"]),
++            ],
++        ];
++        for messages in histories {
++            validate_history(messages.clone())
++                .unwrap_or_else(|err| panic!("{messages:?} should validate: {err}"));
++        }
++    }
++
++    #[test]
++    fn test_validate_messages_rejects_unknown_tool_call_id() {
++        let err = validate_history(vec![
++            user("weather?"),
++            assistant_tool_calls(&["call_1"]),
++            tool_result("call_999_wrong"),
++        ])
++        .expect_err("unknown tool_call_id should fail validation");
++        assert!(
++            err.to_string()
++                .contains("`messages[2].tool_call_id` 'call_999_wrong' does not match"),
++            "unexpected error: {err}"
++        );
++    }
++
++    #[test]
++    fn test_validate_messages_rejects_tool_message_without_tool_calls() {
++        let histories = [
++            vec![user("weather?"), tool_result("call_1")],
++            vec![
++                user("weather?"),
++                assistant_tool_calls(&["call_1"]),
++                tool_result("call_1"),
++                user("thanks"),
++                tool_result("call_1"),
++            ],
++        ];
++        for messages in histories {
++            let err = validate_history(messages.clone())
++                .expect_err("tool message outside a tool-call turn should fail validation");
++            assert!(
++                err.to_string()
++                    .contains("must be a response to a preceding"),
++                "unexpected error for {messages:?}: {err}"
++            );
++        }
++    }
++
++    #[test]
++    fn test_validate_messages_rejects_missing_tool_results() {
++        let histories = [
++            vec![
++                user("weather?"),
++                assistant_tool_calls(&["call_1", "call_2"]),
++                tool_result("call_1"),
++            ],
++            vec![
++                user("weather?"),
++                assistant_tool_calls(&["call_1", "call_2"]),
++                tool_result("call_1"),
++                user("and tomorrow?"),
++            ],
++            vec![
++                user("weather?"),
++                assistant_tool_calls(&["call_1", "call_2"]),
++                user("never mind"),
++            ],
++        ];
++        for messages in histories {
++            let err = validate_history(messages.clone())
++                .expect_err("unanswered tool calls should fail validation");
++            let err = err.to_string();
++            assert!(
++                err.contains("`messages[1].tool_calls` must be followed by tool messages")
++                    && err.contains("call_2"),
++                "unexpected error for {messages:?}: {err}"
++            );
++        }
++    }
++
+     #[test]
+     fn test_validate_tools_valid_names() {
+         fn make_tool(name: &str) -> ChatCompletionTool {
+diff --git a/lib/llm/src/protocols/openai/validate.rs b/lib/llm/src/protocols/openai/validate.rs
+index 60cbf3595683..1b02e056b8dd 100644
+--- a/lib/llm/src/protocols/openai/validate.rs
++++ b/lib/llm/src/protocols/openai/validate.rs
+@@ -1,7 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ // SPDX-License-Identifier: Apache-2.0
+ 
+-use std::{borrow::Cow, fmt::Display, sync::LazyLock};
++use std::{borrow::Cow, collections::HashSet, fmt::Display, sync::LazyLock};
+ 
+ use dynamo_protocols::types::{
+     ChatCompletionTool, ChatCompletionToolType, CreateChatCompletionRequest, FunctionObject,
+@@ -564,7 +564,83 @@ pub fn validate_messages(
+             }
+         }
+     }
+-    Ok(())
++    validate_tool_results(messages)
++}
++
++struct PendingToolCalls<'a> {
++    message_index: usize,
++    issued: HashSet<&'a str>,
++    unanswered: HashSet<&'a str>,
++    has_results: bool,
++}
++
++impl PendingToolCalls<'_> {
++    fn ensure_answered(&self) -> Result<(), anyhow::Error> {
++        if !self.unanswered.is_empty() {
++            let mut unanswered: Vec<&str> = self.unanswered.iter().copied().collect();
++            unanswered.sort_unstable();
++            anyhow::bail!(
++                "`messages[{}].tool_calls` must be followed by tool messages responding to each \
++                 `tool_call_id`; missing responses for: {}",
++                self.message_index,
++                unanswered.join(", ")
++            );
++        }
++        Ok(())
++    }
++}
++
++/// Each `tool` message must answer a call issued by the assistant message right before its run
++/// of tool messages, and that run must answer every call. Results may arrive in any order.
++/// A trailing assistant message whose calls have no results yet is accepted.
++fn validate_tool_results(
++    messages: &[dynamo_protocols::types::ChatCompletionRequestMessage],
++) -> Result<(), anyhow::Error> {
++    use dynamo_protocols::types::ChatCompletionRequestMessage;
++
++    let mut pending: Option<PendingToolCalls> = None;
++    for (message_index, message) in messages.iter().enumerate() {
++        if let ChatCompletionRequestMessage::Tool(tool) = message {
++            let Some(calls) = pending.as_mut() else {
++                anyhow::bail!(
++                    "`messages[{message_index}]` with role 'tool' must be a response to a \
++                     preceding assistant message with `tool_calls`"
++                );
++            };
++            let id = tool.tool_call_id.as_str();
++            if !calls.issued.contains(id) {
++                anyhow::bail!(
++                    "`messages[{message_index}].tool_call_id` '{id}' does not match any \
++                     `tool_calls` id of `messages[{}]`",
++                    calls.message_index
++                );
++            }
++            calls.unanswered.remove(id);
++            calls.has_results = true;
++            continue;
++        }
++        if let Some(calls) = pending.take() {
++            calls.ensure_answered()?;
++        }
++        if let ChatCompletionRequestMessage::Assistant(assistant) = message
++            && let Some(tool_calls) = assistant
++                .tool_calls
++                .as_ref()
++                .filter(|calls| !calls.is_empty())
++        {
++            let issued: HashSet<&str> = tool_calls.iter().map(|call| call.id.as_str()).collect();
++            pending = Some(PendingToolCalls {
++                message_index,
++                unanswered: issued.clone(),
++                issued,
++                has_results: false,
++            });
++        }
++    }
++    match pending {
++        Some(calls) if calls.has_results => calls.ensure_answered(),
++        _ => Ok(()),
++    }
+ }
+ 
+ fn validate_json_object_string(value: &str, field: String) -> Result<(), anyhow::Error> {
+diff --git a/lib/llm/tests/anthropic_http_replay.rs b/lib/llm/tests/anthropic_http_replay.rs
+index ae212690170e..eeb7a11840e9 100644
+--- a/lib/llm/tests/anthropic_http_replay.rs
++++ b/lib/llm/tests/anthropic_http_replay.rs
+@@ -851,6 +851,60 @@ async fn tool_result_round_trip_reaches_the_chat_engine() {
+     .await;
+ }
+ 
++#[tokio::test]
++#[serial]
++async fn text_before_tool_result_keeps_tool_result_after_its_call() {
++    temp_env::async_with_vars(ENV, async {
++        let svc = HarnessService::start([load_agent_fixture("text.sse").await.unwrap()]).await;
++
++        let response = post_messages(
++            &svc,
++            &json!({
++                "model": MODEL,
++                "max_tokens": 64,
++                "stream": false,
++                "tools": [tool("list_directory")],
++                "messages": [
++                    {"role": "user", "content": "List /tmp"},
++                    {"role": "assistant", "content": [{
++                        "type": "tool_use",
++                        "id": "toolu_1",
++                        "name": "list_directory",
++                        "input": {"path": "/tmp"}
++                    }]},
++                    {"role": "user", "content": [
++                        {"type": "text", "text": "Here you go."},
++                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt"}
++                    ]}
++                ]
++            }),
++        )
++        .await;
++        assert_eq!(response.status(), reqwest::StatusCode::OK);
++
++        let requests = svc.engine.take_requests().await;
++        assert_eq!(requests.len(), 1);
++        match &requests[0].inner.messages[..] {
++            [
++                ChatCompletionRequestMessage::User(_),
++                ChatCompletionRequestMessage::Assistant(_),
++                ChatCompletionRequestMessage::Tool(tool_result),
++                ChatCompletionRequestMessage::User(user),
++            ] => {
++                assert_eq!(tool_result.tool_call_id, "toolu_1");
++                assert!(matches!(
++                    &user.content,
++                    ChatCompletionRequestUserMessageContent::Text(text) if text == "Here you go."
++                ));
++            }
++            other => panic!("unexpected translated messages: {other:#?}"),
++        }
++
++        svc.shutdown().await;
++    })
++    .await;
++}
++
+ #[tokio::test]
+ #[serial]
+ async fn count_tokens_returns_exact_estimate_without_calling_engine() {

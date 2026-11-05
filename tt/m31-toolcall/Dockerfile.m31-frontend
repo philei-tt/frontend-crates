@@ -1,0 +1,72 @@
+# M3.1 tool-call frontend: the deployed tt-d-gen e025a59d frontend image (ai-dynamo 1.5.0) with ai-dynamo and
+# ai-dynamo-runtime rebuilt from ai-dynamo/dynamo main, so MiniMax M3/M3.1 takes the v2 UnifiedParser
+# (ai-dynamo/dynamo#17236), and dynamo-parsers-v2 replaced by philei-tt/frontend-crates
+# tt/m31-toolcall-fixes-v0.9.6 (v0.9.6 + frontend-crates #525 + #526 + required-nullable/edge-newline fix).
+# Entrypoint and dynamo_frontend_env.sh stay the base image's, so the Helm chart drives it unchanged.
+#
+# Build from this directory (it holds dynamo-patches/); needs pull access to the ghcr base image:
+#   docker build -f Dockerfile.m31-frontend -t dynamo-frontend:m31-toolcall .
+
+ARG BASE_IMAGE=ghcr.io/tenstorrent/tt-d-gen/dynamo-frontend:sha-e025a59d9e14746d7f7ce52ca1a46dd8bdf94ed5
+
+FROM python:3.12-bookworm AS build
+
+ARG DYNAMO_REPO=https://github.com/ai-dynamo/dynamo.git
+ARG DYNAMO_REV=945f7850591b72b2c5c648729e981490205bdb28
+ARG PARSERS_REPO=https://github.com/philei-tt/frontend-crates
+ARG PARSERS_REV=0022bb16fba3ec3edcfc8d912ff767a6eaccba89
+ARG PROTOC_VERSION=25.3
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends cmake clang libclang-dev unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL -o /tmp/protoc.zip \
+        "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" \
+    && unzip -q -o /tmp/protoc.zip -d /usr/local 'bin/protoc' 'include/*' \
+    && rm /tmp/protoc.zip
+ENV PROTOC=/usr/local/bin/protoc
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl -fsSL -o /tmp/rustup.sh https://sh.rustup.rs \
+    && sh /tmp/rustup.sh -y --default-toolchain none --profile minimal --no-modify-path \
+    && rm /tmp/rustup.sh
+
+RUN pip install --no-cache-dir uv maturin
+
+# Dynamo-side fixes not on main yet; each file names its upstream PR. Applied in name order.
+#   0001: ai-dynamo/dynamo#16476, reject tool results that do not pair with tool calls (verifier 16_08, 16_09).
+COPY dynamo-patches /src/dynamo-patches
+
+WORKDIR /src/dynamo
+RUN git init -q . \
+    && git fetch -q --depth 1 "${DYNAMO_REPO}" "${DYNAMO_REV}" \
+    && git checkout -q FETCH_HEAD \
+    && for p in /src/dynamo-patches/*.patch; do echo "applying $p"; patch -p1 --forward -i "$p" || exit 1; done
+
+# lib/bindings/python is its own Cargo workspace; the patch there covers every crate in the wheel build,
+# dynamo-llm included. Crate version stays 0.9.6, matching dynamo main's `=0.9.6` pin.
+RUN printf '\n[patch.crates-io]\ndynamo-parsers-v2 = { git = "%s", rev = "%s" }\n' "${PARSERS_REPO}" "${PARSERS_REV}" \
+        >> lib/bindings/python/Cargo.toml
+
+RUN uv build --wheel --out-dir /wheels \
+    && cd lib/bindings/python \
+    && maturin build --release --compatibility linux --out /wheels \
+    && ls -l /wheels \
+    && cargo metadata --format-version 1 --offline \
+        | PARSERS_REPO="${PARSERS_REPO}" python3 -c "import json,os,sys; ps=[p for p in json.load(sys.stdin)['packages'] if p['name']=='dynamo-parsers-v2']; print([(p['version'], p['source']) for p in ps]); sys.exit(0 if ps and all((p['source'] or '').startswith('git+'+os.environ['PARSERS_REPO']) for p in ps) else 1)"
+
+FROM ${BASE_IMAGE} AS runtime
+ARG DYNAMO_REV=945f7850591b72b2c5c648729e981490205bdb28
+ARG PARSERS_REV=0022bb16fba3ec3edcfc8d912ff767a6eaccba89
+COPY --from=build /wheels/ /tmp/wheels/
+RUN (command -v uv >/dev/null || pip install --no-cache-dir uv) \
+    && uv pip install --python /app/.venv/bin/python --reinstall \
+        /tmp/wheels/ai_dynamo-*.whl /tmp/wheels/ai_dynamo_runtime-*.whl \
+    && rm -rf /tmp/wheels \
+    && /app/.venv/bin/python -c "import importlib.metadata as m; print('ai-dynamo', m.version('ai-dynamo'), 'runtime', m.version('ai-dynamo-runtime'))"
+LABEL ai.dynamo.revision="${DYNAMO_REV}" \
+      ai.dynamo.frontend-crates.revision="${PARSERS_REV}" \
+      tt.m31-toolcall="v0.9.6+525+526+tt-nullable-newline"
