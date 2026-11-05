@@ -23,8 +23,8 @@ use crate::tool_calling::v1core::{MiniMaxM3ParserConfig, ToolDefinition};
 use super::{GuidedRouted, ScannerUnified, UnifiedParser};
 use crate::tool_calling::traits::{Tool, ToolCallDelta};
 use crate::tool_calling::v1core::xml::minimax_m3_parser::{
-    M3ParameterKind, parameter_kind, parameter_path_kind, parse_invoke_name,
-    parse_minimax_m3_invoke,
+    M3ParameterKind, append_required_nulls, parameter_kind, parameter_path_kind,
+    parse_invoke_name, parse_minimax_m3_invoke,
 };
 use std::{collections::HashSet, sync::Arc};
 
@@ -309,6 +309,9 @@ struct PartialParameter {
     start: usize,
     boundary: Option<M3InvokeBoundary>,
     streamable: bool,
+    /// Whether the one newline `trim_tag_newlines` drops after the open tag has
+    /// been ruled in or out (streamable parameters only).
+    leading_checked: bool,
 }
 
 impl InvokeEmitter for M3Emitter {
@@ -396,21 +399,41 @@ impl InvokeEmitter for M3Emitter {
                     partial.active = None;
                     continue;
                 }
+                // Match `trim_tag_newlines`: one newline just inside either tag is
+                // dropped, so it is held back until the bytes around it decide.
+                if !active.leading_checked {
+                    let tail = &invoke[active.cursor..];
+                    if tail.is_empty() || tail == "\r" {
+                        break;
+                    }
+                    if tail.starts_with("\r\n") {
+                        active.cursor += 2;
+                    } else if tail.starts_with('\n') {
+                        active.cursor += 1;
+                    }
+                    active.leading_checked = true;
+                }
                 let tail = &invoke[active.cursor..];
                 let close = tail.find(&active.close).map(|at| active.cursor + at);
-                let end = close.unwrap_or_else(|| {
+                let mut end = close.unwrap_or_else(|| {
                     invoke.len() - marker_prefix_suffix_len(tail, [active.close.as_str()])
                 });
+                let segment = &invoke[active.cursor..end];
+                if segment.ends_with("\r\n") {
+                    end -= 2;
+                } else if segment.ends_with('\n') || (close.is_none() && segment.ends_with('\r')) {
+                    end -= 1;
+                }
                 let encoded = serde_json::to_string(&invoke[active.cursor..end])?;
                 arguments.push_str(&encoded[1..encoded.len() - 1]);
                 active.value_json.push_str(&encoded[1..encoded.len() - 1]);
                 active.cursor = end;
-                if close.is_some() {
+                if let Some(close) = close {
                     arguments.push('"');
                     partial
                         .members
                         .push((active.name.clone(), format!("\"{}\"", active.value_json)));
-                    partial.cursor = end + active.close.len();
+                    partial.cursor = close + active.close.len();
                     partial.active = None;
                     continue;
                 }
@@ -475,6 +498,7 @@ impl InvokeEmitter for M3Emitter {
                     ..Default::default()
                 }),
                 streamable,
+                leading_checked: false,
             });
         }
         if arguments.is_empty() {
@@ -502,6 +526,8 @@ impl InvokeEmitter for M3Emitter {
             self.partial = None;
             return Ok(None);
         };
+        // Appended after every streamed member, so the streamed prefix still holds.
+        let arguments = append_required_nulls(&name, arguments, &self.tools)?;
         let partial = self.partial.take();
         let prefix = partial
             .as_ref()
